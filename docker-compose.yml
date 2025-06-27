@@ -1,0 +1,100 @@
+services:
+  app:
+    image: ani4s-dev
+    container_name: ${APP_NAME}-${FRAMEWORK}
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-3000}:${APP_PORT:-3000}"
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASS=${DB_PASS}
+      - APP_PORT=${APP_PORT:-3000}
+    networks:
+      - ani4s-network
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${APP_PORT:-3000}/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    volumes:
+      - ./:/app
+
+  db:
+    image: ${APP_NAME}-postgres:${DB_VERSION}
+    container_name: ${APP_NAME}-postgres
+    restart: unless-stopped
+    ports:
+      - "5436:5432"
+    environment:
+      - POSTGRES_DB=${DB_NAME}
+      - POSTGRES_USER=${DB_USER}
+      - POSTGRES_PASSWORD=${DB_PASS}
+      - POSTGRES_INITDB_ARGS=--encoding=UTF-8 --lc-collate=C --lc-ctype=C
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    networks:
+      - ani4s-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: ${APP_NAME}-redis:${REDIS_VERSION}
+    container_name: ${APP_NAME}-redis
+    restart: always
+    healthcheck:
+      test: [ "CMD", "redis-cli", "ping" ]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    ports:
+      - "6372:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - ani4s-network
+volumes:
+  db_data:
+    driver: local
+  redis_data:
+    name: ${APP_NAME}-redis-data
+
+networks:
+  ani4s-network:
+    name: ${APP_NAME}-network
+    driver: bridge
+
+x-bake:
+  app:
+    dockerfile: Dockerfile
+    tags:
+      - ${APP_NAME}-${FRAMEWORK}:${APP_VERSION}
+    platforms: ["linux/amd64"]
+    cache-from: type=registry,ref=${APP_NAME}-${FRAMEWORK}:cache
+    cache-to: type=registry,ref=${APP_NAME}-${FRAMEWORK}:cache,mode=max
+
+  db:
+    dockerfile: Dockerfile.psql
+    tags:
+      - ${APP_NAME}-postgres:${DB_VERSION}
+    platforms: [ "linux/amd64" ]
+    cache-from: type=registry,ref=${APP_NAME}-postgres:cache
+    cache-to: type=registry,ref=${APP_NAME}-postgres:cache,mode=max
+
+  redis:
+    dockerfile: Dockerfile.redis
+    tags:
+      - ${APP_NAME}-redis:${REDIS_VERSION}
+    platforms: [ "linux/amd64" ]
+    cache-from: type=registry,ref=${APP_NAME}-redis:cache
+    cache-to: type=registry,ref=${APP_NAME}-redis:cache,mode=max
