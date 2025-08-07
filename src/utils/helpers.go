@@ -1,10 +1,21 @@
 package utils
 
 import (
+	"ani4s/src/config"
+	movies "ani4s/src/modules/movies/models"
+	"bytes"
+	"context"
+	"encoding/json"
+	"fmt"
+
 	"github.com/gin-gonic/gin"
+	"github.com/minio/minio-go/v7"
+
+	"io/ioutil"
 	"math"
 	"net/http"
 	"strconv"
+	"strings"
 )
 
 func Paginate(total int64, page, perPage int) (map[string]interface{}, error) {
@@ -118,4 +129,207 @@ func BindJson(c *gin.Context, request interface{}) *ServiceError {
 		}
 	}
 	return nil
+}
+
+func IsValidApiResponse(raw map[string]interface{}) (map[string]interface{}, bool) {
+	// Nếu đã có data và data chứa item
+	if data, ok := raw["data"]; ok {
+		if dmap, ok := data.(map[string]interface{}); ok {
+			if items, hasItem := dmap["items"]; hasItem {
+				enriched := EnrichThumbFromDatabase(items)
+				dmap["items"] = enriched
+				return raw, true
+			}
+		}
+	}
+
+	// Nếu "items" ở root
+	if items, ok := raw["items"]; ok {
+		pagination := raw["pagination"]
+
+		enriched := EnrichThumbFromDatabase(items)
+
+		data := map[string]interface{}{
+			"items": enriched,
+		}
+		if pagination != nil {
+			data["pagination"] = pagination
+		}
+		return map[string]interface{}{
+			"data": data,
+		}, true
+	}
+
+	// Danh sách key cần kiểm tra
+	candidates := []string{"episodes", "movies", "list", "data"}
+
+	for _, key := range candidates {
+		if val, exists := raw[key]; exists {
+			enriched := EnrichThumbFromDatabase(val)
+			return map[string]interface{}{
+				"data": map[string]interface{}{
+					"items": map[string]interface{}{
+						key: enriched,
+					},
+				},
+			}, true
+		}
+	}
+
+	return nil, false
+}
+
+func EnrichThumbFromDatabase(items interface{}) interface{} {
+	db := config.DB
+	list, ok := items.([]interface{})
+	if !ok {
+		return items
+	}
+
+	// Bước 1: Collect all valid IDs
+	var ids []string
+	for _, i := range list {
+		if m, ok := i.(map[string]interface{}); ok {
+			if id, ok := m["_id"].(string); ok && id != "" {
+				ids = append(ids, id)
+			}
+		}
+	}
+
+	if len(ids) == 0 {
+		return items
+	}
+
+	// Bước 2: Query từ DB (Movie.ID -> ThumbURL)
+	type Result struct {
+		ID       string
+		ThumbURL string
+	}
+	var dbResults []Result
+	if err := db.
+		Model(&movies.Movie{}).
+		Select("id", "thumb_url").
+		Where("id IN ?", ids).
+		Find(&dbResults).Error; err != nil {
+		fmt.Printf("[EnrichThumb] DB error: %v\n", err)
+		return items
+	}
+
+	// Bước 3: Dùng map tra nhanh
+	thumbMap := make(map[string]string, len(dbResults))
+	for _, r := range dbResults {
+		if r.ThumbURL != "" {
+			thumbMap[r.ID] = r.ThumbURL
+		}
+	}
+
+	// Bước 4: Duyệt danh sách gốc và cập nhật nếu có DB match
+	for _, i := range list {
+		if m, ok := i.(map[string]interface{}); ok {
+			if id, ok := m["_id"].(string); ok {
+				if newThumb, exists := thumbMap[id]; exists {
+					m["thumb_url"] = newThumb
+				}
+			}
+		}
+	}
+
+	return list
+}
+
+func TranslateToEnglish(text string) (string, error) {
+	payload := map[string]string{
+		"q":      text,
+		"source": "vi",
+		"target": "en",
+		"format": "text",
+	}
+	body, _ := json.Marshal(payload)
+
+	resp, err := http.Post("https://libretranslate.com/translate", "application/json", bytes.NewReader(body))
+	if err != nil {
+		return text, err
+	}
+	defer resp.Body.Close()
+
+	data, _ := ioutil.ReadAll(resp.Body)
+	var result map[string]string
+	if err := json.Unmarshal(data, &result); err != nil {
+		return text, err
+	}
+	return result["translatedText"], nil
+}
+
+func TranslateValuesInItems(items []interface{}) {
+	for _, item := range items {
+		if video, ok := item.(map[string]interface{}); ok {
+			if name, ok := video["name"].(string); ok {
+				if enName, err := TranslateToEnglish(name); err == nil {
+					video["name_en"] = enName
+				}
+			}
+			if origin, ok := video["origin_name"].(string); ok {
+				if enOrigin, err := TranslateToEnglish(origin); err == nil {
+					video["origin_name_en"] = enOrigin
+				}
+			}
+		}
+	}
+}
+
+// DownloadImageIfNotExist downloads an image if it's phimimg.com and not in local
+func DownloadImageIfNotExist(url string) (string, error) {
+	const prefix = "https://phimimg.com/"
+	if !strings.HasPrefix(url, prefix) {
+		return url, nil
+	}
+
+	minioClient := config.MinioClient
+	bucketName := config.BucketName
+
+	relativePath := strings.TrimPrefix(url, prefix)
+
+	// Kiểm tra object đã tồn tại chưa
+	_, err := minioClient.StatObject(context.Background(), bucketName, relativePath, minio.GetObjectOptions{})
+	if err == nil {
+		return relativePath, nil // đã có ảnh
+	}
+
+	// Tải ảnh từ URL
+	resp, err := http.Get(url)
+	if err != nil {
+		return "", fmt.Errorf("failed to download image: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("bad status when downloading image: %d", resp.StatusCode)
+	}
+
+	// Kiểm tra và tạo bucket nếu chưa có
+	exists, err := minioClient.BucketExists(context.Background(), bucketName)
+	if err != nil {
+		return "", fmt.Errorf("failed to check/create bucket: %w", err)
+	}
+	if !exists {
+		err = minioClient.MakeBucket(context.Background(), bucketName, minio.MakeBucketOptions{})
+		if err != nil {
+			return "", fmt.Errorf("failed to create bucket: %w", err)
+		}
+	}
+
+	// Lưu ảnh lên MinIO bucket
+	_, err = minioClient.PutObject(
+		context.Background(),
+		bucketName,
+		relativePath,
+		resp.Body,
+		resp.ContentLength,
+		minio.PutObjectOptions{ContentType: resp.Header.Get("Content-Type")},
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to upload image to minio: %w", err)
+	}
+
+	return relativePath, nil
 }

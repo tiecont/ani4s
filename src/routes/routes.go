@@ -2,9 +2,11 @@ package routes
 
 import (
 	"ani4s/src/config"
+	files "ani4s/src/modules/files/controllers"
 	movies "ani4s/src/modules/movies/controllers"
-	"github.com/gin-gonic/gin"
 	"net/http"
+
+	"github.com/gin-gonic/gin"
 )
 
 func RegisterRoutes(router *gin.Engine) {
@@ -42,5 +44,14 @@ func RegisterRoutes(router *gin.Engine) {
 		moviesRoutes.POST("tim-kiem", movies.SearchMovies)
 		moviesRoutes.POST("the-loai", movies.ListMoviesByCategory)
 		moviesRoutes.POST("quoc-gia", movies.ListMoviesByCountry)
+		moviesRoutes.GET("categories", movies.ListCategories)
+		moviesRoutes.GET("country", movies.ListCountry)
+	}
+
+	// Static Proxy MinIO
+	staticProxyRoutes := api.Group("/static")
+	{
+		staticProxyRoutes.GET("/*filepath", files.FileController)
+		
 	}
 }

@@ -3,65 +3,79 @@ package movies
 import (
 	"ani4s/src/config"
 	movies "ani4s/src/modules/movies/lib"
+	"ani4s/src/utils"
 	"encoding/json"
 	"fmt"
+	"golang.org/x/sync/singleflight"
 	"net/url"
 	"time"
 )
+
+var requestGroup singleflight.Group
 
 func GetMovieList(req movies.MovieListRequest) (map[string]interface{}, error) {
 	rdb := config.RDB
 	ctx := config.Ctx
 
-	targetURL := buildListURL(req)
 	cacheKey := buildCacheKey(req)
 
-	// 1. Try Redis cache first
-	cached, err := rdb.Get(ctx, cacheKey).Result()
-	if err == nil {
-		var cachedData map[string]interface{}
-		if err := json.Unmarshal([]byte(cached), &cachedData); err == nil {
-			cachedData["from_cache"] = true
-			return cachedData, nil
+	// 1. Try Redis cache
+	if cached, err := rdb.Get(ctx, cacheKey).Bytes(); err == nil && len(cached) > 0 {
+		var result map[string]interface{}
+		if jsonErr := json.Unmarshal(cached, &result); jsonErr == nil {
+			result["from_cache"] = true
+			return result, nil
 		}
 	}
 
-	// 2. Fetch from API if no cache
-	responseBody, err := MakeAnonymousRequest(targetURL)
+	// 2. Use singleflight to prevent duplicate API calls
+	rawResult, err, _ := requestGroup.Do(cacheKey, func() (interface{}, error) {
+		// 2a. Fetch from remote API
+		targetURL := buildListURL(req)
+		body, err := MakeAnonymousRequest(targetURL)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch from upstream API: %w", err)
+		}
+
+		var apiResponse map[string]interface{}
+		if err := json.Unmarshal(body, &apiResponse); err != nil {
+			return nil, fmt.Errorf("invalid JSON from upstream: %w", err)
+		}
+
+		normalized, ok := utils.IsValidApiResponse(apiResponse)
+		if !ok {
+			return map[string]interface{}{
+				"success": false,
+				"error":   "Unexpected response structure, skip caching",
+			}, nil
+		}
+
+		// Add metadata
+		normalized["from_cache"] = false
+		normalized["request_url"] = targetURL
+		normalized["timestamp"] = time.Now().Unix()
+
+		// 2c. Encode to JSON once
+		jsonBytes, _ := json.Marshal(apiResponse)
+
+		// 2d. Save to Redis with pipeline
+		ttl := 16 * time.Hour
+		tagKey := "movie_list:cached_keys"
+
+		pipe := rdb.Pipeline()
+		pipe.Set(ctx, cacheKey, jsonBytes, ttl)
+		pipe.SAdd(ctx, tagKey, cacheKey)
+		pipe.Expire(ctx, tagKey, 12*time.Hour)
+		_, _ = pipe.Exec(ctx)
+
+		return apiResponse, nil
+	})
+
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch data from API: %w", err)
+		return nil, err
 	}
 
-	var apiResponse map[string]interface{}
-	if err := json.Unmarshal(responseBody, &apiResponse); err != nil {
-		return map[string]interface{}{
-			"success":  false,
-			"error":    "Failed to parse API response",
-			"raw_data": string(responseBody),
-		}, nil
-	}
-
-	apiResponse["from_cache"] = false
-	apiResponse["request_url"] = targetURL
-	apiResponse["timestamp"] = time.Now().Unix()
-
-	// 3. Save raw response in Redis (short TTL if recently updated list)
-	var ttl time.Duration
-	ttl = 16 * time.Hour
-
-	jsonStr, _ := json.Marshal(apiResponse)
-	_ = rdb.Set(ctx, cacheKey, jsonStr, ttl).Err()
-
-	// 4. Save key for later background indexing
-	tagKey := "movie_list:cached_keys"
-	rdb.SAdd(ctx, tagKey, cacheKey)
-	rdb.Expire(ctx, tagKey, 12*time.Hour)
-
-	// Trả lại response gốc dạng map
-	var returnMap map[string]interface{}
-	_ = json.Unmarshal(jsonStr, &returnMap)
-
-	return returnMap, nil
+	return rawResult.(map[string]interface{}), nil
 }
 
 // GetSearchMovies performs a search query using phimapi.com and caches the response
@@ -72,24 +86,23 @@ func GetSearchMovies(req movies.MovieSearchRequest) (map[string]interface{}, err
 	targetURL := buildSearchURL(req)
 	cacheKey := buildSearchCacheKey(req)
 
-	// 1. Try Redis cache first
-	cached, err := rdb.Get(ctx, cacheKey).Result()
-	if err == nil {
-		var cachedData map[string]interface{}
-		if err := json.Unmarshal([]byte(cached), &cachedData); err == nil {
-			cachedData["from_cache"] = true
-			return cachedData, nil
+	// 1. Redis cache first
+	if cached, err := rdb.Get(ctx, cacheKey).Bytes(); err == nil && len(cached) > 0 {
+		var result map[string]interface{}
+		if jsonErr := json.Unmarshal(cached, &result); jsonErr == nil {
+			result["from_cache"] = true
+			return result, nil
 		}
 	}
 
-	// 2. Call API
+	// 2. Fetch from upstream
 	responseBody, err := MakeAnonymousRequest(targetURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch search results from API: %w", err)
 	}
 
-	var apiResponse map[string]interface{}
-	if err := json.Unmarshal(responseBody, &apiResponse); err != nil {
+	var raw map[string]interface{}
+	if err := json.Unmarshal(responseBody, &raw); err != nil {
 		return map[string]interface{}{
 			"success":  false,
 			"error":    "Failed to parse API response",
@@ -97,19 +110,34 @@ func GetSearchMovies(req movies.MovieSearchRequest) (map[string]interface{}, err
 		}, nil
 	}
 
-	apiResponse["from_cache"] = false
-	apiResponse["request_url"] = targetURL
-	apiResponse["timestamp"] = time.Now().Unix()
+	// 3. Normalize response
+	normalized, ok := utils.IsValidApiResponse(raw)
+	if !ok {
+		return map[string]interface{}{
+			"success": false,
+			"error":   "Unexpected response structure, skip caching",
+		}, nil
+	}
 
-	// 3. Cache TTL for search is shorter (because it changes more)
-	jsonStr, _ := json.Marshal(apiResponse)
-	_ = rdb.Set(ctx, cacheKey, jsonStr, 16*time.Hour).Err()
+	// 4. Metadata
+	normalized["from_cache"] = false
+	normalized["request_url"] = targetURL
+	normalized["timestamp"] = time.Now().Unix()
 
-	// 4. Track cached key for potential indexing
+	// 5. Marshal once
+	jsonStr, _ := json.Marshal(normalized)
+
+	// 6. Cache with shorter TTL for search
+	ttl := 8 * time.Hour
 	tagKey := "movie_search:cached_keys"
-	rdb.SAdd(ctx, tagKey, cacheKey)
-	rdb.Expire(ctx, tagKey, 12*time.Hour)
 
+	pipe := rdb.Pipeline()
+	pipe.Set(ctx, cacheKey, jsonStr, ttl)
+	pipe.SAdd(ctx, tagKey, cacheKey)
+	pipe.Expire(ctx, tagKey, 12*time.Hour)
+	_, _ = pipe.Exec(ctx)
+
+	// 7. Return final map
 	var returnMap map[string]interface{}
 	_ = json.Unmarshal(jsonStr, &returnMap)
 	return returnMap, nil

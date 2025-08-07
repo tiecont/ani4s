@@ -3,8 +3,9 @@ package movies
 import (
 	lib "ani4s/src/modules/movies/lib"
 	movies "ani4s/src/modules/movies/services"
-	"github.com/gin-gonic/gin"
 	"net/http"
+
+	"github.com/gin-gonic/gin"
 )
 
 func NewestUpdateMovies(c *gin.Context) {

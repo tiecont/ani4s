@@ -4,14 +4,13 @@ import (
 	"ani4s/src/config"
 	lib "ani4s/src/modules/movies/lib"
 	movies "ani4s/src/modules/movies/models"
+	"ani4s/src/utils"
 	"compress/gzip"
 	"crypto/tls"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 	"io"
-	"log"
 	"net/http"
 	"net/url"
 	"strings"
@@ -85,7 +84,7 @@ func GetListNewestMovies(page, v int) (map[string]interface{}, error) {
 	rdb := config.RDB
 	ctx := config.Ctx
 
-	// Define URL
+	// Xây dựng URL
 	var targetURL string
 	if v == 1 {
 		targetURL = fmt.Sprintf("https://phimapi.com/danh-sach/phim-moi-cap-nhat?page=%d", page)
@@ -93,36 +92,58 @@ func GetListNewestMovies(page, v int) (map[string]interface{}, error) {
 		targetURL = fmt.Sprintf("https://phimapi.com/danh-sach/phim-moi-cap-nhat-v%d?page=%d", v, page)
 	}
 
-	cacheKey := fmt.Sprintf("newest_movies:%s", targetURL)
+	cacheKey := fmt.Sprintf("movie_newest:%s", targetURL)
 
-	// Try Redis
-	cached, err := rdb.Get(ctx, cacheKey).Result()
-	if err == nil {
-		var cachedData map[string]interface{}
-		if err := json.Unmarshal([]byte(cached), &cachedData); err == nil {
-			return cachedData, nil
+	// 1. Thử lấy từ Redis cache
+	if cached, err := rdb.Get(ctx, cacheKey).Bytes(); err == nil && len(cached) > 0 {
+		var result map[string]interface{}
+		if jsonErr := json.Unmarshal(cached, &result); jsonErr == nil {
+			result["from_cache"] = true
+			return result, nil
 		}
 	}
 
-	// Request API
+	// 2. Gọi API gốc
 	responseBody, err := MakeAnonymousRequest(targetURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch newest movie list: %w", err)
 	}
 
-	// Parse response JSON
-	var parsed struct {
-		Items []movies.Movie `json:"items"`
-	}
-	if err := json.Unmarshal(responseBody, &parsed); err != nil {
-		return map[string]interface{}{"data": string(responseBody)}, nil
+	// 3. Parse JSON dạng bất kỳ
+	var raw map[string]interface{}
+	if err := json.Unmarshal(responseBody, &raw); err != nil {
+		return map[string]interface{}{
+			"success":  false,
+			"error":    "Failed to parse API response",
+			"raw_data": string(responseBody),
+		}, nil
 	}
 
-	// Cache response (TTL 30 phút)
-	jsonStr, _ := json.Marshal(parsed)
-	_ = rdb.Set(ctx, cacheKey, jsonStr, 30*time.Minute).Err()
+	// 4. Normalize theo chuẩn `data.item`
+	normalized, ok := utils.IsValidApiResponse(raw)
+	if !ok {
+		return map[string]interface{}{
+			"success": false,
+			"error":   "Unexpected response structure",
+		}, nil
+	}
 
-	// Trả lại response gốc dạng map
+	// 5. Metadata + cache
+	normalized["from_cache"] = false
+	normalized["request_url"] = targetURL
+	normalized["timestamp"] = time.Now().Unix()
+
+	jsonStr, _ := json.Marshal(normalized)
+	ttl := 16 * time.Hour
+	tagKey := "movie_newest:cached_keys"
+
+	pipe := rdb.Pipeline()
+	pipe.Set(ctx, cacheKey, jsonStr, ttl)
+	pipe.SAdd(ctx, tagKey, cacheKey)
+	pipe.Expire(ctx, tagKey, ttl)
+	_, _ = pipe.Exec(ctx)
+
+	// 6. Trả về map
 	var returnMap map[string]interface{}
 	_ = json.Unmarshal(jsonStr, &returnMap)
 
@@ -135,81 +156,92 @@ func GetDetailsMovie(slug string) (map[string]interface{}, error) {
 	db := config.DB
 
 	targetURL := fmt.Sprintf("https://phimapi.com/phim/%s", slug)
-	cacheKey := fmt.Sprintf("details_movies:%s", targetURL)
+	cacheKey := fmt.Sprintf("movie_details:%s", targetURL)
 
-	// 1. Try cache
-	if cached, err := rdb.Get(ctx, cacheKey).Result(); err == nil {
-		var cachedData map[string]interface{}
-		if jsonErr := json.Unmarshal([]byte(cached), &cachedData); jsonErr == nil {
-			return cachedData, nil
+	// 1. Check Redis cache
+	if cached, err := rdb.Get(ctx, cacheKey).Bytes(); err == nil {
+		var result map[string]interface{}
+		if jsonErr := json.Unmarshal(cached, &result); jsonErr == nil {
+			result["from_cache"] = true
+			return result, nil
 		}
 	}
 
-	// 2. Try from DB
+	// 2. Check local DB
 	if res, err := GetMovieDetailsFromDB(slug); err == nil {
+		res["from_cache"] = false
 		return res, nil
-	} else if !errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, err
+	} else {
+		fmt.Printf("[MovieDetails] Fallback to API for slug %s due to DB error: %v\n", slug, err)
 	}
 
-	// 3. Call external API
+	// 3. Fetch from external API
 	responseBody, err := MakeAnonymousRequest(targetURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to fetch movie details: %w", err)
 	}
 
 	// 4. Parse API response
 	var data movies.MovieDetails
 	if err := json.Unmarshal(responseBody, &data); err != nil {
-		return map[string]interface{}{"data": string(responseBody)}, nil
+		return map[string]interface{}{
+			"success":  false,
+			"error":    "Invalid API response",
+			"raw_data": string(responseBody),
+		}, nil
 	}
 
-	var categories []movies.Category
-	for _, cat := range data.Movie.Categories {
-		var c movies.Category
-		if err := db.FirstOrCreate(&c, movies.Category{ID: cat.ID}).Error; err == nil {
-			categories = append(categories, c)
-		}
-	}
-	data.Movie.Categories = categories
+	// 5. Save to DB with transaction
+	tx := db.Begin()
 
-	var countries []movies.Country
-	for _, country := range data.Movie.Countries {
-		var c movies.Country
-		if err := db.FirstOrCreate(&c, movies.Country{ID: country.ID}).Error; err == nil {
-			countries = append(countries, c)
-		}
-	}
-	data.Movie.Countries = countries
-
-	// 5. Save movie
-	if err := db.Where("id = ?", data.Movie.ID).First(&movies.Movie{}).Error; errors.Is(err, gorm.ErrRecordNotFound) {
-		if err := db.Create(&data.Movie).Error; err != nil {
-			log.Printf("Failed to save movie: %v", err)
-		}
+	if err := tx.Clauses(clause.OnConflict{
+		Columns:   []clause.Column{{Name: "id"}},
+		DoNothing: true,
+	}).Create(&data.Movie).Error; err != nil {
+		tx.Rollback()
+		return nil, fmt.Errorf("failed to upsert movie: %w", err)
 	}
 
-	// 6. Save episodes (clean data, no nested movie)
 	for _, group := range data.Episodes {
 		for _, ep := range group.ServerData {
 			ep.MovieID = data.Movie.ID
-			ep.Movie = movies.Movie{} // Avoid circular serialization
+			ep.Movie = movies.Movie{}
 			ep.ServerName = group.ServerName
-			if err := db.Save(&ep).Error; err != nil {
-				log.Printf("Failed to save episode %s: %v", ep.Name, err)
+
+			err := tx.Clauses(clause.OnConflict{
+				Columns:   []clause.Column{{Name: "slug"}},
+				DoNothing: true,
+			}).Create(&ep).Error
+
+			if err != nil && !strings.Contains(err.Error(), "duplicate key") {
+				tx.Rollback()
+				return nil, fmt.Errorf("failed to upsert episode: %w", err)
 			}
 		}
 	}
 
-	// 7. Assemble and cache
-	result := map[string]interface{}{
-		"status":   true,
-		"msg":      "",
-		"movie":    data.Movie,
-		"episodes": data.Episodes,
+	if err := tx.Commit().Error; err != nil {
+		return nil, fmt.Errorf("transaction commit failed: %w", err)
 	}
-	jsonBytes, _ := json.Marshal(result)
-	_ = rdb.Set(ctx, cacheKey, jsonBytes, 12*time.Hour).Err()
+
+	// 6. Build response
+	result := map[string]interface{}{
+		"data": map[string]interface{}{
+			"movie":    data.Movie,
+			"episodes": data.Episodes,
+		},
+		"from_cache":  false,
+		"request_url": targetURL,
+		"timestamp":   time.Now().Unix(),
+	}
+
+	// 7. Save to Redis cache
+	if jsonStr, err := json.Marshal(result); err == nil {
+		ttl := 16 * time.Hour
+		pipe := rdb.Pipeline()
+		pipe.Set(ctx, cacheKey, jsonStr, ttl)
+		_, _ = pipe.Exec(ctx)
+	}
 
 	return result, nil
 }
@@ -220,60 +252,67 @@ func GetMovieDetailsFromDB(slug string) (map[string]interface{}, error) {
 	ctx := config.Ctx
 
 	targetURL := fmt.Sprintf("https://phimapi.com/phim/%s", slug)
-	cacheKey := fmt.Sprintf("details_movies:%s", targetURL)
+	cacheKey := fmt.Sprintf("movie_details:%s", targetURL)
 
-	// 1. Find movie
+	// 1. Movie
 	var movie movies.Movie
-	if err := db.Where("slug = ?", slug).First(&movie).Error; err != nil {
-		return nil, err
-	}
-
 	if err := db.Preload("Categories").Preload("Countries").Where("slug = ?", slug).First(&movie).Error; err != nil {
-		if errors.Is(err, gorm.ErrRecordNotFound) {
-			return nil, fmt.Errorf("movie not found in database: %s", slug)
-		}
 		return nil, err
 	}
 
-	// 2. Find episodes
+	// 2. Episodes
 	var allEpisodes []movies.Episode
 	if err := db.Where("movie_id = ?", movie.ID).Find(&allEpisodes).Error; err != nil {
-		return nil, fmt.Errorf("failed to load episodes: %v", err)
+		return nil, fmt.Errorf("failed to load episodes: %w", err)
 	}
 
-	// 3. Group by server name
+	// ❗️Nếu không có episodes => xoá Redis và trả lỗi để fallback sang API
+	if len(allEpisodes) == 0 {
+		_ = rdb.Del(ctx, cacheKey).Err()
+		return nil, fmt.Errorf("no episodes found for movie slug: %s", slug)
+	}
+
+	// 3. Group episodes
 	grouped := make(map[string][]movies.Episode)
 	for _, ep := range allEpisodes {
-		ep.Movie = movies.Movie{} // Avoid embedding full movie in each episode
+		ep.Movie = movies.Movie{} // tránh circular reference
 		grouped[ep.ServerName] = append(grouped[ep.ServerName], ep)
 	}
 
-	// 4. Format to []EpisodeGroup
 	var episodeGroups []movies.EpisodeGroup
-	for serverName, eps := range grouped {
+	for server, eps := range grouped {
 		episodeGroups = append(episodeGroups, movies.EpisodeGroup{
-			ServerName: serverName,
+			ServerName: server,
 			ServerData: eps,
 		})
 	}
 
-	// 5. Final result
+	// 4. Format response
 	result := map[string]interface{}{
-		"status":   true,
-		"msg":      "",
-		"movie":    movie,
-		"episodes": episodeGroups,
+		"data": map[string]interface{}{
+			"movie":    movie,
+			"episodes": episodeGroups,
+		},
+		"from_cache":  true,
+		"request_url": targetURL,
+		"timestamp":   time.Now().Unix(),
 	}
 
-	// 6. Cache it
+	// 5. Lưu vào Redis
 	if jsonStr, err := json.Marshal(result); err == nil {
-		_ = rdb.Set(ctx, cacheKey, jsonStr, 12*time.Hour).Err()
+		ttl := 16 * time.Hour
+		tagKey := "movie_details:cached_keys"
+
+		pipe := rdb.Pipeline()
+		pipe.Set(ctx, cacheKey, jsonStr, ttl)
+		pipe.SAdd(ctx, tagKey, cacheKey)
+		pipe.Expire(ctx, tagKey, ttl)
+		_, _ = pipe.Exec(ctx)
 	}
 
 	return result, nil
 }
 
-// ListMoviesByCategory fetches movies by category from phimapi.com with Redis caching
 func ListMoviesByCategory(req lib.MoviesByCategoryRequest) (map[string]interface{}, error) {
 	rdb := config.RDB
 	ctx := config.Ctx
@@ -281,9 +320,8 @@ func ListMoviesByCategory(req lib.MoviesByCategoryRequest) (map[string]interface
 	targetURL := buildCategoryURL(req)
 	cacheKey := buildCategoryCacheKey(req)
 
-	// 1. Try Redis cache first
-	cached, err := rdb.Get(ctx, cacheKey).Result()
-	if err == nil {
+	// 1. Redis cache
+	if cached, err := rdb.Get(ctx, cacheKey).Result(); err == nil {
 		var cachedData map[string]interface{}
 		if err := json.Unmarshal([]byte(cached), &cachedData); err == nil {
 			cachedData["from_cache"] = true
@@ -291,14 +329,15 @@ func ListMoviesByCategory(req lib.MoviesByCategoryRequest) (map[string]interface
 		}
 	}
 
-	// 2. Call API
+	// 2. Call phimapi
 	responseBody, err := MakeAnonymousRequest(targetURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch category movies: %w", err)
 	}
 
-	var apiResponse map[string]interface{}
-	if err := json.Unmarshal(responseBody, &apiResponse); err != nil {
+	// 3. Parse raw JSON
+	var raw map[string]interface{}
+	if err := json.Unmarshal(responseBody, &raw); err != nil {
 		return map[string]interface{}{
 			"success":  false,
 			"error":    "Failed to parse API response",
@@ -306,25 +345,33 @@ func ListMoviesByCategory(req lib.MoviesByCategoryRequest) (map[string]interface
 		}, nil
 	}
 
-	apiResponse["from_cache"] = false
-	apiResponse["request_url"] = targetURL
-	apiResponse["timestamp"] = time.Now().Unix()
+	// 4. Chuẩn hoá về dạng data.items
+	normalized, ok := utils.IsValidApiResponse(raw)
+	if !ok {
+		return map[string]interface{}{
+			"success": false,
+			"error":   "Unexpected response structure",
+		}, nil
+	}
+	// 5. Add metadata
+	normalized["from_cache"] = false
+	normalized["request_url"] = targetURL
+	normalized["timestamp"] = time.Now().Unix()
 
-	// 3. Cache the result
-	var ttl time.Duration
-	ttl = 16 * time.Hour
-	jsonStr, _ := json.Marshal(apiResponse)
-	_ = rdb.Set(ctx, cacheKey, jsonStr, ttl).Err()
+	// 6. Cache
+	jsonStr, _ := json.Marshal(normalized)
+	_ = rdb.Set(ctx, cacheKey, jsonStr, 16*time.Hour).Err()
 
-	// 4. Track tag key for indexing
 	tagKey := "movie_category:cached_keys"
-	rdb.SAdd(ctx, tagKey, cacheKey)
-	rdb.Expire(ctx, tagKey, 12*time.Hour)
+	ttl := 16 * time.Hour
 
-	var returnMap map[string]interface{}
-	_ = json.Unmarshal(jsonStr, &returnMap)
+	pipe := rdb.Pipeline()
+	pipe.Set(ctx, cacheKey, jsonStr, ttl)
+	pipe.SAdd(ctx, tagKey, cacheKey)
+	pipe.Expire(ctx, tagKey, ttl)
+	_, _ = pipe.Exec(ctx)
 
-	return returnMap, nil
+	return normalized, nil
 }
 
 // buildCategoryURL constructs the phimapi.com URL for category browsing
@@ -363,9 +410,8 @@ func ListMoviesByCountry(req lib.MoviesByCategoryRequest) (map[string]interface{
 	targetURL := buildCountryURL(req)
 	cacheKey := buildCountryCacheKey(req)
 
-	// 1. Try Redis cache first
-	cached, err := rdb.Get(ctx, cacheKey).Result()
-	if err == nil {
+	// 1. Redis cache
+	if cached, err := rdb.Get(ctx, cacheKey).Result(); err == nil {
 		var cachedData map[string]interface{}
 		if err := json.Unmarshal([]byte(cached), &cachedData); err == nil {
 			cachedData["from_cache"] = true
@@ -373,14 +419,15 @@ func ListMoviesByCountry(req lib.MoviesByCategoryRequest) (map[string]interface{
 		}
 	}
 
-	// 2. Call API
+	// 2. Call remote API
 	responseBody, err := MakeAnonymousRequest(targetURL)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch country movies: %w", err)
 	}
 
-	var apiResponse map[string]interface{}
-	if err := json.Unmarshal(responseBody, &apiResponse); err != nil {
+	// 3. Parse raw response
+	var raw map[string]interface{}
+	if err := json.Unmarshal(responseBody, &raw); err != nil {
 		return map[string]interface{}{
 			"success":  false,
 			"error":    "Failed to parse API response",
@@ -388,25 +435,33 @@ func ListMoviesByCountry(req lib.MoviesByCategoryRequest) (map[string]interface{
 		}, nil
 	}
 
-	apiResponse["from_cache"] = false
-	apiResponse["request_url"] = targetURL
-	apiResponse["timestamp"] = time.Now().Unix()
+	// 4. Normalize response to `data.items`
+	normalized, ok := utils.IsValidApiResponse(raw)
+	if !ok {
+		return map[string]interface{}{
+			"success": false,
+			"error":   "Unexpected response structure",
+		}, nil
+	}
 
-	// 3. Cache the result
-	var ttl time.Duration
-	ttl = 16 * time.Hour
-	jsonStr, _ := json.Marshal(apiResponse)
-	_ = rdb.Set(ctx, cacheKey, jsonStr, ttl).Err()
+	// 5. Add metadata
+	normalized["from_cache"] = false
+	normalized["timestamp"] = time.Now().Unix()
+	normalized["request_url"] = targetURL
 
-	// 4. Track tag key for indexing
-	tagKey := "movie_country:cached_keys"
-	rdb.SAdd(ctx, tagKey, cacheKey)
-	rdb.Expire(ctx, tagKey, 12*time.Hour)
+	// 6. Cache it
+	if jsonStr, err := json.Marshal(normalized); err == nil {
+		tagKey := "movie_country:cached_keys"
+		ttl := 16 * time.Hour
 
-	var returnMap map[string]interface{}
-	_ = json.Unmarshal(jsonStr, &returnMap)
+		pipe := rdb.Pipeline()
+		pipe.Set(ctx, cacheKey, jsonStr, ttl)
+		pipe.SAdd(ctx, tagKey, cacheKey)
+		pipe.Expire(ctx, tagKey, ttl)
+		_, _ = pipe.Exec(ctx)
+	}
 
-	return returnMap, nil
+	return normalized, nil
 }
 
 func buildCountryURL(req lib.MoviesByCategoryRequest) string {

@@ -10,7 +10,7 @@ import (
 type Movie struct {
 	ID             string         `json:"_id" gorm:"primaryKey;type:varchar(64)"`
 	Name           string         `json:"name"`
-	Slug           string         `json:"slug"`
+	Slug           string         `json:"slug" gorm:"uniqueIndex;type:varchar(255)"`
 	OriginName     string         `json:"origin_name"`
 	Content        string         `json:"content" gorm:"type:text"`
 	Type           string         `json:"type"`

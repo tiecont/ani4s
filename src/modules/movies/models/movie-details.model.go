@@ -20,7 +20,7 @@ type Episode struct {
 	Movie      Movie  `json:"-" gorm:"foreignKey:MovieID;references:ID;constraint:OnUpdate:CASCADE,OnDelete:SET NULL"`
 	ServerName string `json:"-" json:"server_name"`
 	Name       string `json:"name"`
-	Slug       string `json:"slug"`
+	Slug       string `json:"slug" gorm:"uniqueIndex;type:varchar(255)"`
 	Filename   string `json:"filename"`
 	LinkEmbed  string `json:"link_embed"`
 	LinkM3U8   string `json:"link_m3u8"`
